@@ -172,6 +172,8 @@ COUNTRIES = {
     (line.split("|") for line in COUNTRY_TEXT.strip().splitlines())
 }
 ALIASES = {
+    # Trading Economics titles and instrument labels use US / US 10Y.
+    "United States": ("US", "U.S."),
     "Czechia": ("Czech Republic",), "Türkiye": ("Turkey",),
     "South Korea": ("Korea", "Korea, Republic of"),
     "China": ("China (People's Republic of)",),
@@ -1304,6 +1306,35 @@ class FinancialVerification(unittest.TestCase):
                 parse_yield_html(html, wrong)
         with self.assertRaises(DataUnavailable):
             parse_yield_html(html.replace("10-Year", "5-Year").replace("10Y", "5Y"), "Colombia")
+
+    def test_us_yield_short_country_name_metadata(self):
+        # Synthetic quote; mirrors the public U.S. page's actual instrument names.
+        html = """<title>US 10 Year Treasury Note Yield - Quote - Chart</title>
+        <script>TEChartsMeta = [
+        {"symbol":"USGG5YR:IND","name":"US 5Y","full_name":"US 5 Year Note Bond Yield","last":9.9},
+        {"symbol":"USGG10YR:IND","name":"US 10Y","full_name":"US 10 Year Note Bond Yield","last":4.1234}
+        ];</script>
+        <script type="application/ld+json">{"@type":"Dataset",
+        "name":"US 10 Year Treasury Note Yield Data",
+        "temporalCoverage":"1912-01-01/2026-11-13"}</script>"""
+        quote, date, _ = parse_yield_html(html, "United States")
+        self.assertAlmostEqual(quote, 0.041234, places=14)
+        self.assertEqual(date, "2026-11-13")
+        with self.assertRaises(DataUnavailable):
+            parse_yield_html(html, "United Kingdom")
+
+    def test_us_yield_short_country_name_table(self):
+        html = """<title>Bond Yields by Country</title>
+        <meta name="description" content="Government Bond 10y">
+        <table><tr><td><a href="/united-states/government-bond-yield">US 2Y</a></td>
+        <td id="p">9.9</td></tr><tr>
+        <td><a href="/united-states/government-bond-yield">US 10Y</a></td>
+        <td id="p">4.12</td><td id="date">Nov/13</td></tr></table>"""
+        quote, date, _ = parse_yield_html(html, "United States", board=True)
+        self.assertEqual(quote, 0.0412)
+        self.assertIn("source omits year", date)
+        with self.assertRaises(DataUnavailable):
+            parse_yield_html(html.replace("US 10Y", "US 5Y"), "United States", board=True)
 
     def test_yield_date_is_not_historical_news(self):
         html = """<title>Colombia 10-Year Government Bond Yield</title>
