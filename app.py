@@ -44,7 +44,7 @@ OECD_API = f"https://sdmx.oecd.org/public/rest/v1/data/{OECD_FLOW}/.A.CIT_C.ST..
 BONDS_URL = "https://tradingeconomics.com/bonds"
 DEFAULT_INDUSTRY = "Software (System & Application)"
 USER_AGENT = "InternationalCostOfCapital/1.0 (educational public-data reader)"
-APP_REVISION = "2026-11-16.2"
+APP_REVISION = "2026-11-16.3"
 
 # ISO 3166-1 alpha-3 / ISO 4217. A missing public quote never removes a country.
 # Bulgaria adopted EUR in 2026. Euro-area yields remain country-specific.
@@ -211,6 +211,7 @@ class Observation:
     value: float
     reference_date: str
     note: str = ""
+    firm_count: int | None = None
 
 
 @dataclass
@@ -350,9 +351,14 @@ def industry_comparison(betas: dict[str, Observation], p: Inputs, selected: str,
         rows.append({
             "Industry": industry, "Selected": industry == selected,
             "Beta overridden": overridden, "Source beta": observation.value if observation else None,
+            "U.S. firms": getattr(observation, "firm_count", None),
             "Beta used": beta_used, "Equity beta": result.beta_e,
             "USD equity (decimal)": result.re_us,
             "Foreign equity (decimal)": result.re_foreign,
+            "USD pretax debt (decimal)": result.rd_us,
+            "Foreign pretax debt (decimal)": result.rd_foreign,
+            "USD after-tax debt (decimal)": result.rd_aftertax_us,
+            "Foreign after-tax debt (decimal)": result.rd_aftertax_foreign,
             "USD WACC (decimal)": result.wacc_us,
             "Foreign WACC (decimal)": result.wacc_foreign,
         })
@@ -421,9 +427,14 @@ def table_grid(table: Any) -> list[list[str]]:
                 colspan = max(1, min(int(cell.get("colspan", 1)), 100))
             except ValueError as exc:
                 raise DataUnavailable("Malformed HTML table spans.") from exc
+            # Excel HTML sometimes splits a word across overflow spans. Inline
+            # fragments must join directly; explicit line breaks still separate words.
+            for br in cell.find_all("br"):
+                br.replace_with(" ")
+            cell_text = " ".join(cell.get_text("", strip=False).split())
             for rr in range(rowspan):
                 for cc in range(colspan):
-                    cells[row_number + rr, column + cc] = cell.get_text(" ", strip=True)
+                    cells[row_number + rr, column + cc] = cell_text
             column += colspan
             width = max(width, column)
     return [[cells.get((r, c), "") for c in range(width)] for r in range(len(trs))]
@@ -469,7 +480,31 @@ def beta_rows(grid: list[list[Any]]) -> dict[str, float]:
     raise DataUnavailable("Could not identify 'Industry Name' and exact 'Unlevered beta' columns.")
 
 
-def parse_beta_xls(content: bytes) -> tuple[dict[str, float], str]:
+def beta_firm_counts(grid: list[list[Any]]) -> dict[str, int]:
+    """Optional source metadata; an unreadable count never replaces a missing beta."""
+    for r, row in enumerate(grid):
+        headers = [normalize(value) for value in row]
+        if "industry name" not in headers or "number of firms" not in headers:
+            continue
+        name_col, count_col = headers.index("industry name"), headers.index("number of firms")
+        counts = {}
+        for data_row in grid[r + 1:]:
+            if max(name_col, count_col) >= len(data_row):
+                continue
+            name = " ".join(str(data_row[name_col]).split())
+            if not name or is_aggregate(name):
+                continue
+            try:
+                count = parse_number(data_row[count_col])
+            except DataUnavailable:
+                continue
+            if count is not None and count >= 0 and count.is_integer():
+                counts[name] = int(count)
+        return counts
+    return {}
+
+
+def parse_beta_xls(content: bytes, firm_counts: dict[str, int] | None = None) -> tuple[dict[str, float], str]:
     try:
         book = xlrd.open_workbook(file_contents=content)
     except (xlrd.XLRDError, xlrd.compdoc.CompDocError, ValueError, IndexError, struct.error, EOFError) as exc:
@@ -492,16 +527,20 @@ def parse_beta_xls(content: bytes) -> tuple[dict[str, float], str]:
                             raise DataUnavailable("Damodaran workbook's publication date is invalid.") from exc
                     else:
                         date = published_date(f"Date updated: {cell.value}")
+        if firm_counts is not None:
+            firm_counts.update(beta_firm_counts(grid))
         return beta_rows(grid), date
     raise DataUnavailable("Damodaran workbook has no recognized U.S. industry beta sheet.")
 
 
-def parse_beta_html(text: str) -> tuple[dict[str, float], str]:
+def parse_beta_html(text: str, firm_counts: dict[str, int] | None = None) -> tuple[dict[str, float], str]:
     soup = BeautifulSoup(text, "html.parser")
     for table in soup.find_all("table"):
         grid = table_grid(table)
         if any("industry name" in [normalize(v) for v in row]
                and "unlevered beta" in [normalize(v) for v in row] for row in grid):
+            if firm_counts is not None:
+                firm_counts.update(beta_firm_counts(grid))
             return beta_rows(grid), published_date(soup.get_text(" ", strip=True))
     raise DataUnavailable("Official beta HTML has no recognized unlevered-beta table.")
 
@@ -511,14 +550,17 @@ def fetch_betas() -> Dataset:
     for url, parser in ((BETA_XLS, parse_beta_xls), (BETA_HTML, parse_beta_html)):
         try:
             response = http_get(url, "*/*")
-            betas, reference = parser(response.content if url == BETA_XLS else response.text)
+            counts = {}
+            betas, reference = parser(response.content if url == BETA_XLS else response.text, counts)
             if len(betas) < 20:
                 raise DataUnavailable("Fewer than 20 valid industries; refusing a likely incomplete table.")
             note = "Exact Unlevered beta column; U.S. industries; aggregate market rows excluded."
             if errors:
                 note += " Official HTML fallback used, at its published rounded precision. " + " | ".join(errors)
             return Dataset("Damodaran U.S. industry betas", url, utc_now(),
-                           {name: Observation(beta, reference) for name, beta in betas.items()}, note)
+                           {name: Observation(beta, reference,
+                                              f"U.S. firms: {counts[name]}" if name in counts else "Firm count unavailable.",
+                                              counts.get(name)) for name, beta in betas.items()}, note)
         except DataUnavailable as exc:
             errors.append(str(exc))
     raise DataUnavailable("Beta retrieval failed: " + " | ".join(errors))
@@ -1087,27 +1129,218 @@ def render_sources(states: dict[str, SourceState], records: list[EffectiveInput]
     st.markdown(f"[OECD dataset and explanatory material]({OECD_PAGE}) · [Public government bonds listing]({BONDS_URL})")
 
 
+def compact_override(name: str, key: str, observation: Observation | None, state: SourceState,
+                     checkbox_label: str, input_label: str, *, percentage: bool = True,
+                     minimum: float = 0.0, maximum: float | None = None,
+                     show_disabled_input: bool = False, source_caption: str | None = None,
+                     show_used: bool = True) -> EffectiveInput:
+    """A compact checkbox override with saved values independent of display widgets."""
+    auto = observation.value if observation else None
+    scale = 100.0 if percentage else 1.0
+    seed = auto * scale if auto is not None else None
+    if seed is not None and not math.isfinite(seed):
+        seed = None
+    store = st.session_state.setdefault("manual_store", {})
+    saved = store.setdefault(key, {"enabled": False, "value": seed})
+    toggle_key, value_key = "override_toggle:" + key, "override_value:" + key
+    if toggle_key not in st.session_state:
+        st.session_state[toggle_key] = saved["enabled"]
+    enabled = st.checkbox(checkbox_label, key=toggle_key)
+    saved["enabled"] = enabled
+    if source_caption is not None:
+        st.caption(source_caption)
+    elif auto is not None:
+        label = percent(auto) if percentage else f"{auto:.8f}"
+        st.caption(f"Automatic: {label} · {observation.reference_date}")
+    else:
+        st.caption("Automatic source unavailable. Enable the override to enter a verified value.")
+    entered = saved["value"]
+    if enabled:
+        if value_key not in st.session_state:
+            st.session_state[value_key] = entered
+        entered = st.number_input(input_label, min_value=minimum, max_value=maximum,
+                                  value=None, step=0.0001 if percentage else 0.01,
+                                  format="%.6f", key=value_key,
+                                  placeholder="Enter a verified value")
+        saved["value"] = entered
+    elif show_disabled_input:
+        # The inactive field shows the current source quote. Its saved manual
+        # entry lives separately and is restored when the checkbox is enabled.
+        st.number_input(input_label, min_value=minimum, max_value=maximum,
+                        value=seed, step=0.0001 if percentage else 0.01,
+                        format="%.6f", disabled=True,
+                        help="Enable the override to use a saved or newly entered manual value.")
+    used = entered / scale if enabled and entered is not None else None if enabled else auto
+    if show_used and (enabled or source_caption is None):
+        label = percent(used) if percentage else "Unavailable" if used is None else f"{used:.8f}"
+        st.caption(f"Used in calculations: {label}" + (" · manual override" if enabled else ""))
+    if enabled and entered is None:
+        st.warning("Enter a value for this enabled override, or uncheck it to use the source.")
+    notes = " | ".join(filter(None, [observation.note if observation else "No matching source observation.",
+                                    state.dataset.note if state.dataset else "", state.error]))
+    return EffectiveInput(name, used, auto, enabled, state.source, state.url,
+                          observation.reference_date if observation else "Unavailable",
+                          state.dataset.retrieved_at if state.dataset else "",
+                          state.status if observation else "Unavailable", notes)
+
+
+def linked_country_yield(us_yield: EffectiveInput, state: SourceState) -> EffectiveInput:
+    observation = lookup(state, "yield")
+    return EffectiveInput("Foreign 10-year yield", us_yield.value,
+                          observation.value if observation else None, False,
+                          state.source, state.url,
+                          observation.reference_date if observation else "Unavailable",
+                          state.dataset.retrieved_at if state.dataset else "",
+                          state.status if observation else "Unavailable",
+                          "Linked to the effective U.S. yield, including its override. "
+                          f"U.S. yield override active: {us_yield.override_active}.")
+
+
+def yield_source_caption(observation: Observation | None, state: SourceState) -> str:
+    if observation is None:
+        return f"Source quote unavailable. Enter a verified 10-year yield manually. [Trading Economics]({state.url})"
+    status = f" · {state.status}" if state.status.startswith("STALE") else ""
+    return f"Source quote: {percent(observation.value)} · {observation.reference_date}{status} · [Trading Economics]({state.url})"
+
+
+def render_detailed_calculation(p: Inputs, r: Results, country: str) -> None:
+    currency = COUNTRIES[country]["currency"]
+    rows = [
+        ("Government yield", percent(p.rf_us), percent(p.rf_foreign)),
+        ("Unlevered beta", f"{p.beta_u:.8f}", f"{p.beta_u:.8f}"),
+        ("Relevered equity beta", f"{r.beta_e:.8f}", f"{r.beta_e:.8f}"),
+        ("Debt-to-equity ratio", f"{r.debt_to_equity:.8f}", f"{r.debt_to_equity:.8f}"),
+        ("Equity risk premium", percent(p.erp), percent(p.erp)),
+        ("Project corporate tax rate", percent(p.tax_rate), percent(p.tax_rate)),
+        ("Debt financing share", percent(p.debt_share), percent(p.debt_share)),
+        ("Borrowing spread", percent(p.spread_us), percent(r.spread_foreign)),
+        ("Cost of equity", percent(r.re_us), percent(r.re_foreign)),
+        ("Pretax cost of debt", percent(r.rd_us), percent(r.rd_foreign)),
+        ("After-tax cost of debt", percent(r.rd_aftertax_us), percent(r.rd_aftertax_foreign)),
+        ("Equity contribution to WACC", percent(r.equity_contribution_us), percent(r.equity_contribution_foreign)),
+        ("Debt contribution to WACC", percent(r.debt_contribution_us), percent(r.debt_contribution_foreign)),
+        ("WACC", percent(r.wacc_us), percent(r.wacc_foreign)),
+    ]
+    st.dataframe(pd.DataFrame(rows, columns=["Metric", "USD financing", f"{currency} financing · {country}"]),
+                 hide_index=True, width="stretch")
+    st.caption(f"Currency factor F = {r.factor:.8f}. The same project tax rate, beta, ERP, and debt share apply to both scenarios.")
+    chart = go.Figure()
+    labels = ["Cost of equity", "After-tax debt", "WACC"]
+    for label, values, color in [
+        ("USD financing", [r.re_us, r.rd_aftertax_us, r.wacc_us], "#353b43"),
+        (f"{currency} financing · {country}", [r.re_foreign, r.rd_aftertax_foreign, r.wacc_foreign], "#b65b5b"),
+    ]:
+        chart.add_bar(name=label, x=labels, y=values, marker_color=color,
+                      hovertemplate="%{x}: %{y:.4%}<extra>%{fullData.name}</extra>")
+    chart.update_layout(barmode="group", height=330, margin=dict(l=5, r=5, t=35, b=0),
+                        yaxis_tickformat=".2%", legend=dict(orientation="h", y=1.16))
+    st.plotly_chart(chart, width="stretch", key="financing_comparison_chart")
+    if st.checkbox("Show WACC contribution breakdown", key="show_wacc_contributions"):
+        breakdown = go.Figure()
+        scenarios = ["USD financing", f"{currency} financing · {country}"]
+        breakdown.add_bar(name="Equity contribution", x=scenarios,
+                          y=[r.equity_contribution_us, r.equity_contribution_foreign], marker_color="#353b43")
+        breakdown.add_bar(name="After-tax debt contribution", x=scenarios,
+                          y=[r.debt_contribution_us, r.debt_contribution_foreign], marker_color="#b65b5b")
+        breakdown.update_layout(barmode="relative", height=290, yaxis_tickformat=".2%",
+                                margin=dict(l=5, r=5, t=20, b=0))
+        st.plotly_chart(breakdown, width="stretch", key="wacc_contributions_chart")
+
+
+def render_verification_tab(p: Inputs | None, industry_frame: pd.DataFrame | None) -> None:
+    """Pure, offline finance checks; never run HTTP-patching unittest fixtures here."""
+    st.write("The professor's Colombia example is independent of live market observations.")
+    reference = Inputs(0.80, 0.30, 0.35, 0.065, 0.04, 0.12, 0.015)
+    actual = calculate(reference)
+    expected = {
+        "debt_to_equity": ("D/E", 3 / 7, False),
+        "beta_e": ("Relevered equity beta", 179 / 175, False),
+        "factor": ("Currency factor F", 14 / 13, False),
+        "re_us": ("USD cost of equity", 0.10648571428571429, True),
+        "rd_us": ("USD pretax debt cost", 0.055, True),
+        "rd_aftertax_us": ("USD after-tax debt cost", 0.03575, True),
+        "wacc_us": ("USD WACC", 0.085265, True),
+        "re_foreign": ("COP cost of equity", 0.1916, True),
+        "spread_foreign": ("COP borrowing spread", 0.016153846153846154, True),
+        "rd_foreign": ("COP pretax debt cost", 0.13615384615384615, True),
+        "rd_aftertax_foreign": ("COP after-tax debt cost", 0.0885, True),
+        "wacc_foreign": ("COP WACC", 0.16067, True),
+    }
+    rows = []
+    for field, (label, value, is_rate) in expected.items():
+        computed = getattr(actual, field)
+        rows.append({"Metric": label,
+                     "Expected": percent(value) if is_rate else f"{value:.8f}",
+                     "Calculated": percent(computed) if is_rate else f"{computed:.8f}",
+                     "Passed": math.isclose(computed, value, rel_tol=1e-11, abs_tol=1e-12)})
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    equal = calculate(replace(reference, rf_foreign=reference.rf_us))
+    zero = calculate(replace(reference, debt_share=0.0))
+    overridden = calculate(replace(reference, spread_foreign_override=0.04))
+    low_tax = calculate(replace(reference, tax_rate=0.25))
+    negative = calculate(replace(reference, rf_us=-0.005, rf_foreign=-0.01))
+    checks = [
+        ("Equal government yields produce equal scenario WACCs", math.isclose(equal.wacc_us, equal.wacc_foreign, abs_tol=1e-12)),
+        ("Zero debt makes WACC equal the corresponding equity cost", zero.wacc_us == zero.re_us and zero.wacc_foreign == zero.re_foreign),
+        ("Foreign spread override preserves USD equity/debt/WACC", all(getattr(actual, k) == getattr(overridden, k) for k in ("re_us", "rd_us", "wacc_us"))),
+        ("Project tax changes both scenario WACCs", low_tax.wacc_us != actual.wacc_us and low_tax.wacc_foreign != actual.wacc_foreign),
+        ("United States comparison links the effective U.S. yield", comparison_yield("United States", 0.04, 0.12) == 0.04),
+        ("Valid negative government yields produce finite results", all(math.isfinite(v) for v in asdict(negative).values())),
+    ]
+    if p is not None and industry_frame is not None:
+        selected_rows = industry_frame[industry_frame["Selected"]]
+        if not selected_rows.empty:
+            selected = selected_rows.iloc[0]
+            current = calculate(p)
+            checks.append(("Current selected industry agrees with the project calculation",
+                           math.isclose(selected["USD WACC (decimal)"], current.wacc_us, abs_tol=1e-12)
+                           and math.isclose(selected["Foreign WACC (decimal)"], current.wacc_foreign, abs_tol=1e-12)))
+    passed = all(row["Passed"] for row in rows) and all(result for _, result in checks)
+    if passed:
+        st.success("Colombia reference and mathematical consistency checks passed.")
+    else:
+        st.error("A financial verification failed. Review the rows below before using the results.")
+    st.dataframe(pd.DataFrame(checks, columns=["Consistency check", "Passed"]), hide_index=True, width="stretch")
+    st.caption("These live-interface checks use only pure calculations. The full embedded test suite also exercises parsing, exports, and source-failure handling.")
+    st.code("python app.py --self-test", language="bash")
+
+
 def main() -> None:
-    st.set_page_config(page_title="International Cost of Capital", page_icon="🌐", layout="wide")
+    st.set_page_config(page_title="Cost of capital", layout="wide", initial_sidebar_state="expanded")
     st.markdown("""<style>
-    .stApp {background:var(--background-color);}
-    [data-testid="stMetric"] {border:1px solid #dce4eb;border-radius:12px;padding:18px;}
-    [data-testid="stMetricValue"] {color:#008e7b;}
-    h1 {letter-spacing:-.045em;} .block-container {padding-top:4.5rem;max-width:1450px;}
-    [data-testid="stSidebar"] {border-right:1px solid #dce4eb;}
+    .stApp, [data-testid="stHeader"] {background:#ffffff;color:#262730;}
+    .block-container {padding-top:3.4rem;padding-bottom:2.5rem;max-width:1230px;}
+    [data-testid="stSidebar"] {background:#f7f7f8;border-right:1px solid #e5e5e7;}
+    [data-testid="stSidebar"] .stVerticalBlock {gap:.6rem;}
+    [data-testid="stSidebar"] h3 {font-size:1.35rem;line-height:1.5;}
+    [data-testid="stSidebar"] label p {font-size:.88rem;}
+    h1 {font-size:2.7rem;letter-spacing:-.035em;font-weight:750;}
+    h2 {font-size:1.8rem;letter-spacing:-.025em;}
+    h3 {font-size:1.5rem;letter-spacing:-.02em;}
+    [data-testid="stMetric"] {border:0;background:transparent;padding:0;}
+    [data-testid="stMetricValue"] {font-size:1.9rem;color:#262730;}
+    [data-testid="stMetricLabel"] p {font-size:.85rem;color:#52525b;}
+    .st-key-primary_results [data-testid="stMetricValue"] {font-size:2.65rem;}
+    [data-testid="stSlider"] [role="slider"] {background-color:#e25454;}
+    hr {border-color:#e4e4e7;}
+    @media(max-width:700px) {
+      .block-container {padding-top:3rem;padding-left:1rem;padding-right:1rem;}
+      h1 {font-size:2.1rem;} [data-testid="stMetricValue"] {font-size:1.55rem;}
+      .st-key-primary_results [data-testid="stMetricValue"] {font-size:2rem;}
+    }
     </style>""", unsafe_allow_html=True)
-    st.caption("INTERNATIONAL FINANCE  /  VALUATION LAB")
-    st.title("International Cost of Capital Calculator")
-    st.write("Compare project equity, borrowing costs, and WACC in U.S. dollars and a selected country's currency.")
+    st.title("Cost of capital")
+    st.caption("U.S. industry betas, corporate taxes, BBB borrowing spreads, and 10-year government bond yields")
+
+    country = st.session_state.get("country") or "United States"
+    if country not in COUNTRIES:
+        country = "United States"
+        st.session_state["country"] = country
     with st.sidebar:
-        st.header("Project assumptions")
-        country = st.selectbox("Target country", sorted(COUNTRIES),
-                               index=sorted(COUNTRIES).index("United States"), key="country")
-        st.caption(f"Selected currency: {COUNTRIES[country]['currency']} · Country: {COUNTRIES[country]['iso']}")
-        refresh = st.button("Refresh Market Data", width="stretch", type="primary")
-    raw_ttl = os.getenv("COC_CACHE_TTL_SECONDS", "3600")
+        st.subheader("Project assumptions")
+        refresh = st.button("Refresh source data", width="stretch", key="refresh_source_data")
     try:
-        ttl = int(raw_ttl)
+        ttl = int(os.getenv("COC_CACHE_TTL_SECONDS", "3600"))
         if ttl < 1:
             raise ValueError("TTL must be positive")
     except ValueError:
@@ -1116,19 +1349,9 @@ def main() -> None:
     cached_fetch = st.cache_data(ttl=ttl, show_spinner=False)(retrieve_for_revision)
     if refresh:
         cached_fetch.clear()
-    with st.spinner("Retrieving public beta, statutory tax, BBB spread, and 10-year yield data…"):
+    with st.spinner("Retrieving source data…"):
         bundle = cached_fetch(country, APP_REVISION)
-    last_good = st.session_state.setdefault("last_good_sources", {})
-    states = reconcile_sources(bundle, last_good, ttl)
-    if refresh:
-        failed = sum(isinstance(item, FetchFailure) for item in bundle.values())
-        if failed:
-            st.warning(f"Refresh completed with {failed} source error(s). Review Sources & status; manual inputs are preserved.")
-        else:
-            st.success("Market data refreshed. Project assumptions and manual values are preserved.")
-    for state in states.values():
-        if state.error or state.status.startswith("STALE"):
-            st.warning(f"{state.source}: {state.status}. " + (state.error or "Cached data exceeded its lifetime."))
+    states = reconcile_sources(bundle, st.session_state.setdefault("last_good_sources", {}), ttl)
     beta_state, tax_state, spread_state = states["betas"], states["taxes"], states["spread"]
     us_yield_state = states["yield:USA"]
     foreign_yield_state = states[f"yield:{COUNTRIES[country]['iso']}"]
@@ -1138,129 +1361,231 @@ def main() -> None:
     with st.sidebar:
         if "industry" in st.session_state and st.session_state["industry"] is None:
             del st.session_state["industry"]
-        industry = st.selectbox("Industry", industries,
-                               index=industries.index(prior_industry), key="industry")
+        industry = st.selectbox("U.S. industry", industries, index=industries.index(prior_industry), key="industry")
         st.session_state["last_selected_industry"] = industry
-        if industry not in betas:
-            st.warning("The selected industry has no beta in the current source dataset. Its selection and saved "
-                       "manual override are preserved; provide a manual beta to calculate this project.")
-        erp = st.number_input("Equity risk premium (%)", min_value=0.0, value=6.5,
-                              step=0.1, format="%.4f", key="erp") / 100
-        debt = st.number_input("Target debt financing share (%)", min_value=0.0,
-                               max_value=99.99, value=30.0, step=1.0, format="%.4f", key="debt") / 100
-        tax_selection = st.radio("Project corporate tax source",
-                                 ["U.S. statutory corporate tax rate", "Selected country's statutory corporate tax rate"],
-                                 key="tax_selection")
-        st.caption("The selected project tax rate applies to BOTH financing scenarios.")
-        st.button("Reset all manual overrides", on_click=reset_manual_inputs, width="stretch")
-        with st.expander("Manual overrides & automatic values", expanded=True):
-            beta = override_control("Unlevered beta", f"beta:{industry}", lookup(beta_state, industry),
-                                    beta_state, percentage=False)
-            us_tax = override_control("U.S. corporate tax rate", "tax:USA", lookup(tax_state, "USA"),
-                                      tax_state, maximum=100.0)
-            foreign_tax = override_control("Foreign corporate tax rate", f"foreign_tax:{COUNTRIES[country]['iso']}",
-                                           lookup(tax_state, COUNTRIES[country]["iso"]), tax_state, maximum=100.0)
-            us_yield = override_control("U.S. 10-year yield", "yield:USA", lookup(us_yield_state, "yield"),
-                                        us_yield_state, minimum=-99.9999)
-            foreign_yield = override_control("Foreign 10-year yield", f"foreign_yield:{COUNTRIES[country]['iso']}",
+        st.selectbox("Unlevered beta measure", ["Unlevered beta"], key="beta_measure",
+                     help="Uses the exact published Unlevered beta column. No cash-corrected or levered beta is substituted.")
+        erp = st.number_input("Annual equity risk premium (%)", min_value=0.0, value=6.5,
+                              step=0.05, format="%.2f", key="erp") / 100
+        # Keep older sessions usable when migrating from the previous 99.99% input.
+        if st.session_state.get("debt") is not None and not 0 <= st.session_state["debt"] <= 99:
+            st.session_state["debt"] = min(99.0, max(0.0, float(st.session_state["debt"])))
+        debt = st.slider("Fraction financed with debt (%)", min_value=0.0, max_value=99.0,
+                         value=30.0, step=0.1, format="%.2f%%", key="debt") / 100
+        automatic_spread = lookup(spread_state, "BBB")
+        spread_caption = (f"BBB spread: {percent(automatic_spread.value, 2)} "
+                          f"({automatic_spread.value * 10000:.0f} basis points) · {automatic_spread.reference_date}"
+                          if automatic_spread else "BBB spread unavailable. Enter a verified borrowing spread below.")
+        if spread_state.status.startswith("STALE"):
+            spread_caption += " · " + spread_state.status
+        us_spread = compact_override("U.S. BBB spread", "spread:USA", automatic_spread, spread_state,
+                                      "Override BBB borrowing spread",
+                                      "USD borrowing spread over U.S. 10-year yield (percentage points)",
+                                      show_disabled_input=True, source_caption=spread_caption)
+        country = st.selectbox("Project country / currency", sorted(COUNTRIES),
+                               index=sorted(COUNTRIES).index(country), key="country")
+        st.caption(f"Currency: {COUNTRIES[country]['currency']}")
+        project_tax_slot = st.container()
+        beta_observation = lookup(beta_state, industry)
+        if beta_observation is None:
+            st.warning("The selected industry's source beta is unavailable. Its selection is preserved; enter a beta in Advanced assumptions and manual overrides.")
+        advanced_missing = beta_observation is None
+        with st.expander("Advanced assumptions and manual overrides", expanded=advanced_missing):
+            beta = compact_override("Unlevered beta", f"beta:{industry}", beta_observation, beta_state,
+                                    "Override industry unlevered beta", "Industry unlevered beta", percentage=False)
+            st.caption("U.S. and selected-country yield overrides are directly available in the 10-year yields section on the main page.")
+            us_tax = compact_override("U.S. corporate tax rate", "tax:USA", lookup(tax_state, "USA"), tax_state,
+                                      "Override U.S. corporate tax data", "U.S. corporate tax data (%)", maximum=100.0)
+            foreign_tax = compact_override("Foreign corporate tax rate", f"foreign_tax:{COUNTRIES[country]['iso']}",
+                                           lookup(tax_state, COUNTRIES[country]["iso"]), tax_state,
+                                           "Override selected-country corporate tax data", "Selected-country corporate tax data (%)", maximum=100.0)
+            foreign_spread_slot = st.container()
+            tax_selection = st.radio("Corporate tax jurisdiction",
+                                     ["U.S. statutory corporate tax rate", "Selected country's statutory corporate tax rate"],
+                                     key="tax_selection")
+            st.button("Reset all manual overrides", on_click=reset_manual_inputs, width="stretch", key="reset_manual_overrides")
+        selected_source_tax = us_tax if tax_selection.startswith("U.S.") else foreign_tax
+        tax_jurisdiction = "United States" if tax_selection.startswith("U.S.") else country
+        source_tax_observation = lookup(tax_state, "USA" if tax_selection.startswith("U.S.") else COUNTRIES[country]["iso"])
+        effective_tax_observation = (Observation(selected_source_tax.value, selected_source_tax.reference_date,
+                                                "Inherited from the selected effective statutory-tax source. "
+                                                f"Source tax override active: {selected_source_tax.override_active}.")
+                                     if selected_source_tax.value is not None else None)
+        raw_tax_caption = (f"OECD combined statutory rate: {percent(source_tax_observation.value, 2)} · {source_tax_observation.reference_date}"
+                           if source_tax_observation else "OECD combined statutory rate unavailable. Enter the project rate manually.")
+        if tax_state.status.startswith("STALE"):
+            raw_tax_caption += " · " + tax_state.status
+        with project_tax_slot:
+            project_tax = compact_override("Project corporate tax rate", "tax:project", effective_tax_observation, tax_state,
+                                           "Override corporate tax rate", "Project corporate tax rate (%)", maximum=100.0,
+                                           source_caption=raw_tax_caption)
+            if selected_source_tax.override_active and not project_tax.override_active:
+                st.caption(f"Using {tax_jurisdiction} source-tax override: {percent(project_tax.value)}.")
+        st.caption("One project tax rate is applied to both financing scenarios.")
+
+    st.subheader("10-year yields used in the calculation")
+    yield_left, yield_right = st.columns(2, gap="large")
+    with yield_left:
+        us_yield = compact_override("U.S. 10-year yield", "yield:USA", lookup(us_yield_state, "yield"), us_yield_state,
+                                     "Enter U.S. 10-year yield manually", "U.S. 10-year government yield (%)",
+                                     minimum=-99.9999,
+                                     source_caption=yield_source_caption(lookup(us_yield_state, "yield"), us_yield_state))
+    with yield_right:
+        st.write(f"Selected country: {country} ({COUNTRIES[country]['currency']})")
+        if country == "United States":
+            foreign_yield = linked_country_yield(us_yield, foreign_yield_state)
+            st.caption("The selected-country yield equals the U.S. yield. No currency conversion is needed.")
+        else:
+            foreign_yield = compact_override("Foreign 10-year yield", f"foreign_yield:{COUNTRIES[country]['iso']}",
                                              lookup(foreign_yield_state, "yield"), foreign_yield_state,
-                                             minimum=-99.9999, linked=us_yield if country == "United States" else None)
-            us_spread = override_control("U.S. BBB spread", "spread:USA", lookup(spread_state, "BBB"), spread_state)
-            # This automatic spread is derived from EFFECTIVE source inputs, including overrides.
+                                             "Enter selected-country 10-year yield manually", "Selected-country 10-year government yield (%)",
+                                             minimum=-99.9999,
+                                             source_caption=yield_source_caption(lookup(foreign_yield_state, "yield"), foreign_yield_state))
+    effective_foreign_yield = comparison_yield(country, us_yield.value, foreign_yield.value)
+    auto_foreign = None
+    if us_spread.value is not None and us_yield.value is not None and effective_foreign_yield is not None:
+        auto_foreign = us_spread.value * ((1 + effective_foreign_yield) / (1 + us_yield.value))
+        if not math.isfinite(auto_foreign):
             auto_foreign = None
-            effective_foreign_yield = comparison_yield(country, us_yield.value, foreign_yield.value)
-            if us_spread.value is not None and us_yield.value is not None and effective_foreign_yield is not None:
-                auto_foreign = us_spread.value * (1 + effective_foreign_yield) / (1 + us_yield.value)
-                if not math.isfinite(auto_foreign):
-                    auto_foreign = None
-            derived = Dataset("Model-derived foreign BBB spread", "", utc_now(), {},
-                              "s_FOREIGN = effective s_US × (1 + effective Rf_FOREIGN) / (1 + effective Rf_US).")
-            derived_state = SourceState(derived.source, "", derived, "Derived from current inputs", derived.retrieved_at)
-            foreign_spread = override_control("Foreign BBB spread", f"foreign_spread:{COUNTRIES[country]['iso']}",
-                                              Observation(auto_foreign, "Derived, not a market quote") if auto_foreign is not None else None,
-                                              derived_state)
-        st.caption(f"Cache lifetime: {ttl:,} seconds. Rates are entered in percent; spreads in percentage points.")
-    records = [beta, us_tax, foreign_tax, us_yield, foreign_yield, us_spread, foreign_spread]
-    selected_tax = us_tax if tax_selection.startswith("U.S.") else foreign_tax
-    required = {"Unlevered beta": beta.value, "Project corporate tax rate": selected_tax.value,
-                "U.S. 10-year yield": us_yield.value, "U.S. BBB spread": us_spread.value}
+    derived = Dataset("Model-derived foreign BBB spread", "", utc_now(), {},
+                      "s_FOREIGN = effective s_US × (1 + effective Rf_FOREIGN) / (1 + effective Rf_US).")
+    derived_state = SourceState(derived.source, "", derived, "Derived from current inputs", derived.retrieved_at)
+    with foreign_spread_slot:
+        foreign_spread = compact_override("Foreign BBB spread", f"foreign_spread:{COUNTRIES[country]['iso']}",
+                                          Observation(auto_foreign, "Derived, not a market quote") if auto_foreign is not None else None,
+                                          derived_state, "Override foreign-currency BBB borrowing spread",
+                                          "Foreign borrowing spread (percentage points)")
+    records = [beta, us_tax, foreign_tax, project_tax, us_yield, foreign_yield, us_spread, foreign_spread]
+    required = {"industry unlevered beta (advanced assumptions)": beta.value,
+                "project corporate tax rate (sidebar)": project_tax.value,
+                "U.S. 10-year yield (main page)": us_yield.value,
+                "USD borrowing spread (sidebar)": us_spread.value}
     if country != "United States":
-        required["Foreign 10-year yield"] = effective_foreign_yield
+        required["selected-country 10-year yield (main page)"] = effective_foreign_yield
     if foreign_spread.override_active:
-        required["Foreign BBB spread override"] = foreign_spread.value
+        required["foreign BBB spread override (advanced assumptions)"] = foreign_spread.value
     missing = [name for name, value in required.items() if value is None]
-    st.markdown("**Market assumptions**")
-    assumption_rows = [{"Assumption": record.name,
-                        "Automatic": f"{record.automatic_value:.8f}" if record.name == "Unlevered beta" and record.automatic_value is not None else percent(record.automatic_value),
-                        "Used": f"{record.value:.8f}" if record.name == "Unlevered beta" and record.value is not None else percent(record.value),
-                        "Mode": "Manual override" if record.override_active else "Derived" if record is foreign_spread else "Automatic / linked",
-                        "Reference": record.reference_date, "Source status": record.status}
-                       for record in records]
-    assumption_rows += [
-        {"Assumption": "Equity risk premium", "Used": percent(erp), "Mode": "Project assumption"},
-        {"Assumption": "Target debt share", "Used": percent(debt), "Mode": "Project assumption"},
-        {"Assumption": "Project tax applied to both scenarios", "Used": percent(selected_tax.value), "Mode": tax_selection},
-        {"Assumption": "Selected country's currency", "Used": COUNTRIES[country]["currency"], "Mode": country},
-    ]
-    with st.expander("Automatic and effective market assumptions", expanded=False):
-        st.dataframe(pd.DataFrame(assumption_rows), hide_index=True, width="stretch")
     p, result = None, None
-    if missing:
-        st.warning("Complete the following inputs using the independent sidebar overrides: " + ", ".join(missing) + ".")
-    else:
+    if not missing:
         try:
-            p = Inputs(beta.value, debt, selected_tax.value, erp, us_yield.value,
+            p = Inputs(beta.value, debt, project_tax.value, erp, us_yield.value,
                        effective_foreign_yield, us_spread.value,
                        foreign_spread.value if foreign_spread.override_active else None)
             result = calculate(p)
         except InputError as exc:
             p = None
             st.error(str(exc))
+
+    st.subheader("Borrowing spreads")
+    currency = COUNTRIES[country]["currency"]
+    spread_columns = st.columns(2) if country != "United States" else [st.container()]
+    with spread_columns[0]:
+        st.metric("Borrowing spread · USD", percent(us_spread.value))
+        if us_spread.value is not None:
+            st.caption(f"{us_spread.value * 10000:.2f} basis points over the U.S. 10-year yield")
+    if country != "United States":
+        with spread_columns[1]:
+            foreign_spread_label = currency if currency != "USD" else f"USD · {country}"
+            st.metric(f"Borrowing spread · {foreign_spread_label}", percent(foreign_spread.value))
+            st.caption("Manual foreign spread override" if foreign_spread.override_active else "Automatically adjusted using the currency factor F")
+    st.header(industry)
+    firms = getattr(beta_observation, "firm_count", None)
+    firms_text = f"{firms:,} U.S. firms." if firms is not None else "U.S. firm count unavailable."
+    beta_date = beta_observation.reference_date if beta_observation else "unavailable"
+    override_text = " · manual project tax override" if project_tax.override_active else ""
+    st.caption(f"{firms_text} Beta data dated {beta_date}. Tax jurisdiction: {tax_jurisdiction}{override_text}; "
+               "the same tax rate is used in both currency scenarios.")
+    assumption_metrics = st.columns(4)
+    assumption_metrics[0].metric("U.S. 10-year yield", percent(us_yield.value, 3))
+    assumption_metrics[1].metric("Selected country 10-year yield", percent(effective_foreign_yield, 3))
+    assumption_metrics[2].metric("Corporate tax rate", percent(project_tax.value, 2))
+    assumption_metrics[3].metric("Unlevered beta", "Unavailable" if beta.value is None else f"{beta.value:.4f}")
+    st.divider()
+    with st.container(key="primary_results"):
+        primary = st.columns(2)
+        primary[0].metric("Equity cost of capital · USD", percent(result.re_us, 2) if result else "Unavailable")
+        primary[1].metric("WACC · USD", percent(result.wacc_us, 2) if result else "Unavailable")
+        changed_us_comparison = (result is not None and country == "United States"
+                                 and not math.isclose(result.wacc_us, result.wacc_foreign, rel_tol=1e-12, abs_tol=1e-12))
+        if country != "United States" or changed_us_comparison:
+            alternate = st.columns(2)
+            scenario_label = (currency if currency != "USD" else f"USD · {country}") if country != "United States" else "USD · selected scenario"
+            alternate[0].metric(f"Equity cost of capital · {scenario_label}", percent(result.re_foreign, 2) if result else "Unavailable")
+            alternate[1].metric(f"WACC · {scenario_label}", percent(result.wacc_foreign, 2) if result else "Unavailable")
+            if changed_us_comparison:
+                st.caption("The selected USD scenario differs because its foreign-spread override is active; the currency factor remains 1.")
+    st.caption("Nominal required returns depend on currency. Project cash flows and discount rates must use a consistent currency.")
+    if country != "United States" and currency == "USD":
+        st.info(f"{country} also uses USD. Its government yield can differ because of sovereign and liquidity risk. "
+                "The scenario difference here reflects the country-yield proxy; it is not a currency conversion or evidence of cheaper financing.")
+    if missing:
+        st.warning("Complete the following inputs to calculate results: " + "; ".join(missing) + ".")
+    source_issues = [state for state in states.values() if state.error or state.status.startswith("STALE")]
+    if refresh:
+        failures = sum(isinstance(item, FetchFailure) for item in bundle.values())
+        if failures:
+            st.warning(f"Source refresh completed with {failures} error(s). Saved manual inputs are preserved; see Data sources.")
+        else:
+            st.success("Source data refreshed. Project selections and manual values are preserved.")
+    if source_issues:
+        with st.expander(f"Source status · {len(source_issues)} source issue(s)"):
+            for state in source_issues:
+                st.warning(f"{state.source}: {state.status}. {state.error}")
+    industry_frame, industry_error = None, None
+    if p is not None and betas:
+        try:
+            industry_frame = industry_comparison(betas, p, industry, beta.override_active)
+        except InputError as exc:
+            industry_error = str(exc)
     generated_at = utc_now()
-    comparison_tab, industries_tab, methodology_tab, sources_tab = st.tabs(
-        ["Financing comparison", "All industries", "Methodology", "Sources & status"])
-    with comparison_tab:
+    detailed_tab, industries_tab, methodology_tab, sources_tab, verification_tab, downloads_tab = st.tabs(
+        ["Detailed calculation", "All industries", "Methodology and assumptions", "Data sources", "Verification", "Downloads"])
+    with detailed_tab:
         if p and result:
-            st.caption(f"{industry} · {country} · Project tax {percent(p.tax_rate)} · Debt share {percent(p.debt_share)}")
-            render_comparison(p, result, country)
+            render_detailed_calculation(p, result, country)
+        else:
+            st.info("The detailed calculation appears when the required source data or manual inputs are available.")
+    with industries_tab:
+        if not betas:
+            st.warning("The industry dataset is unavailable. Manual project inputs still work; all-industry comparison requires the source dataset.")
+        elif industry_error:
+            st.error(f"The all-industry comparison cannot calculate every industry with these assumptions: {industry_error}")
+        elif industry_frame is not None:
+            if beta.override_active:
+                st.info("Only the selected industry uses its manual beta. Other industries retain their individual source betas.")
+            if industry not in betas:
+                st.info("The selected project is included as an additional manual-beta row; its source beta is unavailable.")
+            search = st.text_input("Search industries", placeholder="Type part of an industry name", key="industry_search")
+            visible = industry_frame[industry_frame["Industry"].str.contains(search, case=False, regex=False)] if search else industry_frame
+            st.caption(f"{len(betas)} source industries · Selected: {industry}. Select a column header to sort. Downloads include every row.")
+            formats = {column: "{:.4%}" for column in industry_frame.columns if "(decimal)" in column}
+            formats.update({"Source beta": "{:.8f}", "Beta used": "{:.8f}", "Equity beta": "{:.8f}", "U.S. firms": "{:.0f}"})
+            st.dataframe(visible.style.format(formats, na_rep="Unavailable"), hide_index=True, width="stretch", height=500)
+        else:
+            st.info("Complete the required project inputs to compare all industries.")
+    with methodology_tab:
+        render_methodology(p, result)
+        st.caption("Calculations use full numerical precision. The home screen rounds headline results for readability; detailed tables and CSV files retain greater precision.")
+    with sources_tab:
+        render_sources(states, records)
+        st.caption(f"Cache lifetime: {ttl:,} seconds. The project tax override takes precedence over the selected jurisdiction's effective source rate.")
+    with verification_tab:
+        render_verification_tab(p, industry_frame)
+    with downloads_tab:
+        st.write("Downloads contain the current project assumptions, full-precision results, currency labels, active overrides, and source provenance. Rates are exported as decimals.")
+        if p and result:
             st.download_button("Download selected-project CSV",
                                project_csv(p, result, records, industry, country, tax_selection, generated_at),
                                file_name="selected_project_cost_of_capital.csv", mime="text/csv", on_click="ignore")
         else:
-            st.info("Results appear when the required data or manual inputs are available. No example values are substituted.")
-    with industries_tab:
-        if not betas:
-            st.warning("The industry dataset is unavailable. A manual beta can support the selected project; "
-                       "all-industry comparison requires a successfully retrieved industry dataset.")
-        elif p:
-            if beta.override_active:
-                st.info("Selected industry's beta is manually overridden. Only its row uses that override; "
-                        "other industries retain their individual source betas.")
-            try:
-                table = industry_comparison(betas, p, industry, beta.override_active)
-            except InputError as exc:
-                st.error(f"The all-industry comparison cannot calculate every industry with these assumptions: {exc}")
-            else:
-                if industry not in betas:
-                    st.info("The selected industry's source beta is unavailable. Its additional selected-project row uses "
-                            "the explicit manual beta; all source-industry rows retain their own betas.")
-                search = st.text_input("Search industries", placeholder="Type part of an industry name")
-                visible = table[table["Industry"].str.contains(search, case=False, regex=False)] if search else table
-                st.caption(f"{len(betas)} source industries · Selected: {industry}. Click a column header to sort. Export includes all rows.")
-                formats = {column: "{:.4%}" for column in table.columns if "(decimal)" in column}
-                formats.update({"Source beta": "{:.8f}", "Beta used": "{:.8f}", "Equity beta": "{:.8f}"})
-                st.dataframe(visible.style.format(formats, na_rep="Unavailable"), hide_index=True, width="stretch", height=520)
-                st.download_button("Download all-industry CSV",
-                                   all_industry_export(table, p, country, beta_state, records, generated_at),
-                                   file_name="all_industries_cost_of_capital.csv", mime="text/csv", on_click="ignore")
-        else:
-            st.info("Complete the required project assumptions to calculate all industries.")
-    with methodology_tab:
-        render_methodology(p, result)
-        st.caption("All calculations use full numerical precision. Displayed substitutions are rounded for readability; CSV rates are decimals.")
-    with sources_tab:
-        render_sources(states, records)
-    st.caption("Educational valuation model · Public-source data is best effort · Python 3.12 · Run python app.py --self-test for offline verification.")
+            st.info("Complete the required project inputs to enable the selected-project download.")
+        if p and industry_frame is not None:
+            st.download_button("Download all-industry CSV",
+                               all_industry_export(industry_frame, p, country, beta_state, records, generated_at),
+                               file_name="all_industries_cost_of_capital.csv", mime="text/csv", on_click="ignore")
+        elif industry_error:
+            st.warning("The all-industry download is unavailable until the invalid comparison assumptions are corrected.")
+    st.caption(f"Educational model · Application revision: {APP_REVISION}")
 
 
 # ---------------------------------------------------------------------------
@@ -1379,6 +1704,33 @@ class FinancialVerification(unittest.TestCase):
         values, date = parse_beta_html(html)
         self.assertEqual(values, {"Software": 0.8})
         self.assertEqual(date, "January 2026")
+
+    def test_industry_firm_count_metadata(self):
+        html = """<p>Date of Analysis: January 2026</p><table>
+        <tr><th>Industry Name</th><th>Number of firms</th><th>Beta</th><th>Unlevered beta</th></tr>
+        <tr><td>Software</td><td>309</td><td>9.9</td><td>0.8</td></tr>
+        <tr><td>Other</td><td>N/A</td><td>2</td><td>1.2</td></tr></table>"""
+        counts = {}
+        values, _ = parse_beta_html(html, counts)
+        self.assertEqual(counts, {"Software": 309})
+        self.assertEqual(values, {"Software": 0.8, "Other": 1.2})
+        frame = industry_comparison({"Software": Observation(0.8, "2026", firm_count=309)},
+                                    REFERENCE_INPUTS, "Software", False)
+        row = frame.iloc[0]
+        result = calculate(REFERENCE_INPUTS)
+        self.assertEqual(row["U.S. firms"], 309)
+        self.assertEqual(row["USD pretax debt (decimal)"], result.rd_us)
+        self.assertEqual(row["Foreign pretax debt (decimal)"], result.rd_foreign)
+        self.assertEqual(row["USD after-tax debt (decimal)"], result.rd_aftertax_us)
+        self.assertEqual(row["Foreign after-tax debt (decimal)"], result.rd_aftertax_foreign)
+
+    def test_excel_html_inline_fragments_preserve_industry_identity(self):
+        html = """<table><tr><td>Industry Name</td><td>Number of firms</td><td>Unlevered<br>beta</td></tr>
+        <tr><td>Financial Svcs. (Non-bank &amp; Insur<span>ance)</span></td><td>42</td><td>0.8</td></tr></table>"""
+        counts = {}
+        values, _ = parse_beta_html(html, counts)
+        self.assertEqual(values, {"Financial Svcs. (Non-bank & Insurance)": 0.8})
+        self.assertEqual(counts, {"Financial Svcs. (Non-bank & Insurance)": 42})
 
     def test_bbb_group_and_units(self):
         html = """<p>Date of Analysis: Data used is as of January 2026</p><table>
