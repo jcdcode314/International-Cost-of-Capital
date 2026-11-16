@@ -13,14 +13,16 @@ import json
 import math
 import os
 import re
+import struct
 import sys
 import time
 import unicodedata
 import unittest
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
+from unittest.mock import patch
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -42,6 +44,7 @@ OECD_API = f"https://sdmx.oecd.org/public/rest/v1/data/{OECD_FLOW}/.A.CIT_C.ST..
 BONDS_URL = "https://tradingeconomics.com/bonds"
 DEFAULT_INDUSTRY = "Software (System & Application)"
 USER_AGENT = "InternationalCostOfCapital/1.0 (educational public-data reader)"
+APP_REVISION = "2026-11-16.1"
 
 # ISO 3166-1 alpha-3 / ISO 4217. A missing public quote never removes a country.
 # Bulgaria adopted EUR in 2026. Euro-area yields remain country-specific.
@@ -174,6 +177,7 @@ COUNTRIES = {
 ALIASES = {
     # Trading Economics titles and instrument labels use US / US 10Y.
     "United States": ("US", "U.S."),
+    "United Kingdom": ("UK", "U.K."),
     "Czechia": ("Czech Republic",), "Türkiye": ("Turkey",),
     "South Korea": ("Korea", "Korea, Republic of"),
     "China": ("China (People's Republic of)",),
@@ -278,7 +282,11 @@ def validate_inputs(p: Inputs) -> None:
             continue
         if value is None:
             raise InputError(f"{name} is missing; retrieve it or enable its manual override.")
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        try:
+            finite = not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value)
+        except OverflowError:
+            finite = False
+        if not finite:
             raise InputError(f"{name} must be a finite number.")
     if not 0 <= p.debt_share < 1:
         raise InputError("Target debt share must be at least 0% and strictly below 100%.")
@@ -329,15 +337,19 @@ def comparison_yield(country: str, us: float | None, foreign: float | None) -> f
 def industry_comparison(betas: dict[str, Observation], p: Inputs, selected: str,
                         beta_override: bool) -> pd.DataFrame:
     rows = []
-    for industry, observation in sorted(betas.items()):
+    names = set(betas)
+    if beta_override:
+        names.add(selected)
+    for industry in sorted(names):
         if is_aggregate(industry):
             continue
+        observation = betas.get(industry)
         overridden = industry == selected and beta_override
         beta_used = p.beta_u if overridden else observation.value
         result = calculate(replace(p, beta_u=beta_used))
         rows.append({
             "Industry": industry, "Selected": industry == selected,
-            "Beta overridden": overridden, "Source beta": observation.value,
+            "Beta overridden": overridden, "Source beta": observation.value if observation else None,
             "Beta used": beta_used, "Equity beta": result.beta_e,
             "USD equity (decimal)": result.re_us,
             "Foreign equity (decimal)": result.re_foreign,
@@ -377,8 +389,14 @@ def http_get(url: str, accept: str = "text/html", params: dict | None = None) ->
 
 def parse_number(value: Any) -> float | None:
     """Return source units: '1.5%' becomes 1.5, NOT 0.015. Callers /100."""
+    if isinstance(value, bool):
+        raise DataUnavailable("A Boolean is not a valid financial observation.")
     if isinstance(value, (float, int)):
-        return float(value) if math.isfinite(value) else None
+        try:
+            number = float(value)
+        except OverflowError as exc:
+            raise DataUnavailable("Numeric source field exceeds supported precision.") from exc
+        return number if math.isfinite(number) else None
     text = str(value).strip().replace("\u2212", "-").replace("\xa0", "")
     if normalize(text) in ("", "na", "n/a", "nan", "none", "..", "-", "—"):
         return None
@@ -454,7 +472,7 @@ def beta_rows(grid: list[list[Any]]) -> dict[str, float]:
 def parse_beta_xls(content: bytes) -> tuple[dict[str, float], str]:
     try:
         book = xlrd.open_workbook(file_contents=content)
-    except (xlrd.XLRDError, xlrd.compdoc.CompDocError, ValueError) as exc:
+    except (xlrd.XLRDError, xlrd.compdoc.CompDocError, ValueError, IndexError, struct.error, EOFError) as exc:
         raise DataUnavailable(f"Damodaran XLS could not be decoded: {exc}") from exc
     # The first sheet is a glossary. Inspect every sheet for the actual header.
     for sheet in book.sheets():
@@ -552,11 +570,15 @@ def parse_oecd_csv(text: str, current_year: int) -> dict[str, Observation]:
                 "DIV_TREATMENT", "RATE_STRUCTURE", "TAX_BASE", "TIME_PERIOD", "OBS_VALUE", "UNIT_MULT"}
     if not required.issubset(reader.fieldnames or []):
         raise DataUnavailable("OECD CSV schema does not contain the required statutory-rate dimensions.")
+    if len(reader.fieldnames) != len(set(reader.fieldnames)):
+        raise DataUnavailable("OECD CSV contains duplicate column names.")
     latest: dict[str, Observation] = {}
     exact = {"FREQ": "A", "MEASURE": "CIT_C", "TARGETING": "ST",
              "UNIT_MEASURE": "PT_INC_TAX", "SECTOR": "S13",
              "DIV_TREATMENT": "_Z", "RATE_STRUCTURE": "_Z", "TAX_BASE": "_Z"}
     for row in reader:
+        if None in row or any(row.get(field) is None for field in required):
+            raise DataUnavailable("OECD CSV contains a truncated or misaligned observation row.")
         if any(row.get(k) != v for k, v in exact.items()):
             continue
         if not re.fullmatch(r"\d{4}", row["TIME_PERIOD"]):
@@ -616,6 +638,27 @@ def has_ten_year(text: str) -> bool:
     return bool(re.search(r"\b10\s*[- ]?\s*(?:y\b|yr\b|year\b|years\b)", text, re.I))
 
 
+def inflation_linked(text: str) -> bool:
+    return bool(re.search(r"\b(?:tips|real|inflation[-\s]*(?:linked|indexed|protected))\b", text, re.I))
+
+
+def nominal_ten_year(text: str) -> bool:
+    return has_ten_year(text) and not inflation_linked(text)
+
+
+def nominal_symbol_matches(symbol: Any, country: str) -> bool:
+    """Reject contradictory maturity identifiers, including the known U.S. nominal series."""
+    if symbol is None or symbol == "":
+        return True
+    if not isinstance(symbol, str):
+        return False
+    symbol = symbol.upper().strip()
+    if country == "United States":
+        return symbol in ("USGG10YR:IND", "USGG10YR")
+    maturity = re.search(r"(\d+)(?:YR|Y)(?=:|$)", symbol)
+    return not maturity or int(maturity.group(1)) == 10
+
+
 def observation_date(soup: BeautifulSoup, row: Any = None, country: str | None = None) -> str:
     # Dataset temporal coverage identifies its latest observation, not page refresh.
     if country:
@@ -635,7 +678,7 @@ def observation_date(soup: BeautifulSoup, row: Any = None, country: str | None =
                     if not isinstance(dataset, dict) or dataset.get("@type") != "Dataset":
                         continue
                     name = str(dataset.get("name", ""))
-                    if not (has_ten_year(name) and name_matches(name, country)):
+                    if not (nominal_ten_year(name) and name_matches(name, country)):
                         continue
                     end = str(dataset.get("temporalCoverage", "")).split("/")[-1]
                     if re.fullmatch(r"\d{4}-\d{2}-\d{2}", end):
@@ -644,8 +687,8 @@ def observation_date(soup: BeautifulSoup, row: Any = None, country: str | None =
                         except ValueError:
                             continue
     # Inspect only a current summary/description, never dated news or forecasts.
-    summary = soup.select_one("#market-summary, #historical-desc #description")
-    description = soup.find("meta", attrs={"name": "description"})
+    summary = soup.select_one("#market-summary, #historical-desc #description") if country else None
+    description = soup.find("meta", attrs={"name": "description"}) if country else None
     text = summary.get_text(" ", strip=True) if summary else description.get("content", "") if description else ""
     match = re.search(r"\bon\s+([A-Z][a-z]+\s+\d{1,2},\s+\d{4})\b", text)
     if match:
@@ -669,9 +712,10 @@ def parse_yield_html(text: str, country: str, board: bool = False) -> tuple[floa
         raise DataUnavailable(f"Trading Economics returned an access-restriction page for {country}.")
     description = soup.find("meta", attrs={"name": "description"}) or soup.find("meta", id="metaDesc")
     description_text = description.get("content", "") if description else ""
-    board_ten_year = board and has_ten_year(description_text + " " + title)
-    page_identity = (has_ten_year(title) and any(
+    board_ten_year = board and nominal_ten_year(description_text + " " + title)
+    page_identity = (nominal_ten_year(title) and any(
         normalize(title).startswith(normalize(name) + " ") for name in country_names(country)))
+    metadata_problems = []
     # Public embedded JSON can retain more precision than the displayed row.
     if page_identity:
         for script in soup.find_all("script"):
@@ -681,35 +725,59 @@ def parse_yield_html(text: str, country: str, board: bool = False) -> tuple[floa
                 continue
             try:
                 metadata, _ = json.JSONDecoder().raw_decode(script_text[match.start(1):])
-            except json.JSONDecodeError as exc:
-                raise DataUnavailable("Public bond metadata is no longer valid JSON.") from exc
+            except json.JSONDecodeError:
+                metadata_problems.append("Public quote metadata was malformed.")
+                continue
             if not isinstance(metadata, list):
                 continue
             for item in metadata:
                 if not isinstance(item, dict):
                     continue
                 identity = str(item.get("full_name") or item.get("name") or "")
-                if not has_ten_year(identity) or not name_matches(identity, country):
+                if not nominal_ten_year(identity) or not name_matches(identity, country):
                     continue
-                quote = parse_number(item.get("last", item.get("value")))
+                if not all(nominal_symbol_matches(item.get(field), country) for field in ("symbol", "ticker")):
+                    continue
+                if item.get("type") and normalize(item["type"]) != "bond":
+                    continue
+                if item.get("unit") and normalize(item["unit"]) not in ("percent", "%"):
+                    continue
+                try:
+                    quote = parse_number(item.get("last", item.get("value")))
+                except DataUnavailable:
+                    metadata_problems.append("Public quote metadata had an invalid numeric value.")
+                    continue
                 if quote is not None and quote > -100:
                     row = next((a.find_parent("tr") for a in soup.find_all("a", href=country_url)
-                                if a.find_parent("tr") is not None), None)
+                                if a.find_parent("tr") is not None
+                                and name_matches(a.get_text(" ", strip=True), country)
+                                and not inflation_linked(a.get_text(" ", strip=True))
+                                and nominal_symbol_matches(a.find_parent("tr").get("data-symbol"), country)), None)
                     return quote / 100, observation_date(soup, row, country), "Public page's current 10-year quote metadata."
     # Row fallback requires both exact country path and a verified 10-year maturity.
     for anchor in soup.find_all("a", href=country_url):
         row = anchor.find_parent("tr")
-        if row is None or not name_matches(anchor.get_text(" ", strip=True), country):
+        label = anchor.get_text(" ", strip=True)
+        if row is None or not name_matches(label, country) or inflation_linked(label):
             continue
-        if not (board_ten_year or page_identity or has_ten_year(anchor.get_text(" ", strip=True))):
+        if not nominal_symbol_matches(row.get("data-symbol"), country):
+            continue
+        if not (board_ten_year or page_identity or nominal_ten_year(label)):
             continue
         value_cell = row.select_one('[id="p"], .market-widget-last')
         if value_cell is None:
             continue
-        quote = parse_number(value_cell.get_text(" ", strip=True))
+        try:
+            quote = parse_number(value_cell.get_text(" ", strip=True))
+        except DataUnavailable:
+            continue
         if quote is not None and quote > -100:
-            return quote / 100, observation_date(soup, row, None if board else country), "Public 10-year yield table; source display precision."
-    raise DataUnavailable(f"An exact {country} 10-year government yield was not found on the public page.")
+            note = "Public nominal 10-year yield table; source display precision."
+            if metadata_problems:
+                note += " Table fallback used. " + " ".join(dict.fromkeys(metadata_problems))
+            return quote / 100, observation_date(soup, row, None if board else country), note
+    detail = " " + " ".join(dict.fromkeys(metadata_problems)) if metadata_problems else ""
+    raise DataUnavailable(f"An exact {country} nominal 10-year government yield was not found on the public page." + detail)
 
 
 def fetch_yield(country: str) -> Dataset:
@@ -751,11 +819,19 @@ def retrieve_market_bundle(country: str) -> dict[str, Dataset | FetchFailure]:
     return outputs
 
 
+def retrieve_for_revision(country: str, revision: str) -> dict[str, Dataset | FetchFailure]:
+    """Include the application revision in Streamlit's cache key after parser upgrades."""
+    return retrieve_market_bundle(country)
+
+
 def reconcile_sources(bundle: dict[str, Dataset | FetchFailure], last_good: dict[str, Dataset],
                       ttl: int) -> dict[str, SourceState]:
     states = {}
     for key, result in bundle.items():
         if isinstance(result, Dataset):
+            known = last_good.get(key)
+            if known and datetime.fromisoformat(known.retrieved_at) > datetime.fromisoformat(result.retrieved_at):
+                result = known
             last_good[key] = result
             age = (datetime.now(timezone.utc) - datetime.fromisoformat(result.retrieved_at)).total_seconds()
             status = "Cached response" if age > 5 else "Retrieved"
@@ -764,6 +840,14 @@ def reconcile_sources(bundle: dict[str, Dataset | FetchFailure], last_good: dict
             states[key] = SourceState(result.source, result.url, result, status, result.retrieved_at)
         else:
             old = last_good.get(key)
+            # A country-keyed cached failure may predate a later successful common-source retrieval.
+            if old and datetime.fromisoformat(old.retrieved_at) > datetime.fromisoformat(result.attempted_at):
+                age = (datetime.now(timezone.utc) - datetime.fromisoformat(old.retrieved_at)).total_seconds()
+                status = "Cached response — newer successful retrieval"
+                if age > ttl:
+                    status = "STALE — cache lifetime exceeded"
+                states[key] = SourceState(old.source, old.url, old, status, old.retrieved_at)
+                continue
             states[key] = SourceState(result.source, old.url if old else result.url, old,
                                       "STALE — refresh failed" if old else "Unavailable",
                                       result.attempted_at, result.error)
@@ -804,7 +888,10 @@ def override_control(name: str, key: str, observation: Observation | None, state
     store = st.session_state.setdefault("manual_store", {})
     auto = observation.value if observation else None
     scale = 100.0 if percentage else 1.0
-    saved = store.setdefault(key, {"enabled": False, "value": auto * scale if auto is not None else None})
+    seed = auto * scale if auto is not None else None
+    if seed is not None and not math.isfinite(seed):
+        seed = None
+    saved = store.setdefault(key, {"enabled": False, "value": seed})
     toggle_key, value_key = "override_toggle:" + key, "override_value:" + key
     if toggle_key not in st.session_state:
         st.session_state[toggle_key] = saved["enabled"]
@@ -812,9 +899,10 @@ def override_control(name: str, key: str, observation: Observation | None, state
         st.session_state[value_key] = saved["value"]
     enabled = st.toggle("Override " + name, key=toggle_key, disabled=linked is not None)
     entered = st.number_input(
-        name + (" (%)" if percentage else ""), min_value=minimum, max_value=maximum,
+        "Saved manual " + name + (" (%)" if percentage else ""), min_value=minimum, max_value=maximum,
         step=0.0001 if percentage else 0.01, format="%.6f", key=value_key,
-        disabled=not enabled or linked is not None, placeholder="Enter a verified value")
+        disabled=not enabled or linked is not None, placeholder="Enter a verified value",
+        help="Saved manual entry, used only while this override is enabled. Automatic and Used values below show the current calculation inputs.")
     saved.update(enabled=enabled, value=entered)
     used = (entered / scale if entered is not None else None) if enabled else auto
     if linked is not None:
@@ -855,7 +943,8 @@ def project_csv(p: Inputs, result: Results, records: list[EffectiveInput], indus
             "dimensionless" if record.name == "Unlevered beta" else "decimal rate"))
         rows.append(row)
     for field, value in asdict(result).items():
-        scenario = "USD" if field.endswith("_us") else currency if field.endswith("_foreign") else "shared/derived"
+        scenario = ("USD" if field.endswith("_us") else currency
+                    if field.endswith("_foreign") or field == "spread_foreign_auto" else "shared/derived")
         rows.append({"section": "result", "field": field, "value": value, "currency": scenario,
                      "unit": "dimensionless" if field in ("debt_to_equity", "beta_e", "factor") else "decimal rate"})
     # No display rounding: downloads contain the same full-precision results.
@@ -887,6 +976,10 @@ def render_comparison(p: Inputs, r: Results, country: str) -> None:
     b.metric(f"{currency} WACC · {country}", percent(r.wacc_foreign))
     c.metric("Currency factor F", f"{r.factor:.8f}×")
     st.caption("Nominal returns depend on currency. Discount project cash flows in the same currency as the WACC.")
+    if currency == "USD" and country != "United States":
+        st.info("Both scenarios are denominated in USD. Any difference reflects the selected country's government-yield "
+                "proxy and its sovereign-risk components. Interpret the assignment's relative-yield factor cautiously "
+                "for this same-currency comparison.")
     metrics = [
         ("Risk-free yield", percent(p.rf_us), percent(p.rf_foreign)),
         ("Unlevered beta", f"{p.beta_u:.8f}", f"{p.beta_u:.8f}"),
@@ -966,6 +1059,7 @@ def render_methodology(p: Inputs | None, r: Results | None) -> None:
 
 
 def render_sources(states: dict[str, SourceState], records: list[EffectiveInput]) -> None:
+    st.caption(f"Application revision: {APP_REVISION}")
     for key, state in sorted(states.items()):
         with st.expander(f"{state.source} · {state.status}"):
             st.markdown(f"[Source URL]({state.url})")
@@ -993,7 +1087,7 @@ def main() -> None:
     .stApp {background:var(--background-color);}
     [data-testid="stMetric"] {border:1px solid #dce4eb;border-radius:12px;padding:18px;}
     [data-testid="stMetricValue"] {color:#008e7b;}
-    h1 {letter-spacing:-.045em;} .block-container {padding-top:2rem;max-width:1450px;}
+    h1 {letter-spacing:-.045em;} .block-container {padding-top:4.5rem;max-width:1450px;}
     [data-testid="stSidebar"] {border-right:1px solid #dce4eb;}
     </style>""", unsafe_allow_html=True)
     st.caption("INTERNATIONAL FINANCE  /  VALUATION LAB")
@@ -1013,11 +1107,11 @@ def main() -> None:
     except ValueError:
         ttl = 3600
         st.warning("Invalid COC_CACHE_TTL_SECONDS; using a 3,600-second cache lifetime.")
-    cached_fetch = st.cache_data(ttl=ttl, show_spinner=False)(retrieve_market_bundle)
+    cached_fetch = st.cache_data(ttl=ttl, show_spinner=False)(retrieve_for_revision)
     if refresh:
         cached_fetch.clear()
     with st.spinner("Retrieving public beta, statutory tax, BBB spread, and 10-year yield data…"):
-        bundle = cached_fetch(country)
+        bundle = cached_fetch(country, APP_REVISION)
     last_good = st.session_state.setdefault("last_good_sources", {})
     states = reconcile_sources(bundle, last_good, ttl)
     if refresh:
@@ -1033,14 +1127,17 @@ def main() -> None:
     us_yield_state = states["yield:USA"]
     foreign_yield_state = states[f"yield:{COUNTRIES[country]['iso']}"]
     betas = beta_state.dataset.observations if beta_state.dataset else {}
-    industries = sorted(betas) if betas else [DEFAULT_INDUSTRY]
+    prior_industry = st.session_state.get("industry") or st.session_state.get("last_selected_industry", DEFAULT_INDUSTRY)
+    industries = sorted(set(betas) | {prior_industry})
     with st.sidebar:
-        prior_industry = st.session_state.get("industry", DEFAULT_INDUSTRY)
-        if prior_industry not in industries:
-            st.session_state["industry"] = DEFAULT_INDUSTRY if DEFAULT_INDUSTRY in industries else industries[0]
+        if "industry" in st.session_state and st.session_state["industry"] is None:
+            del st.session_state["industry"]
         industry = st.selectbox("Industry", industries,
-                               index=industries.index(DEFAULT_INDUSTRY) if DEFAULT_INDUSTRY in industries else 0,
-                               key="industry")
+                               index=industries.index(prior_industry), key="industry")
+        st.session_state["last_selected_industry"] = industry
+        if industry not in betas:
+            st.warning("The selected industry has no beta in the current source dataset. Its selection and saved "
+                       "manual override are preserved; provide a manual beta to calculate this project.")
         erp = st.number_input("Equity risk premium (%)", min_value=0.0, value=6.5,
                               step=0.1, format="%.4f", key="erp") / 100
         debt = st.number_input("Target debt financing share (%)", min_value=0.0,
@@ -1133,16 +1230,23 @@ def main() -> None:
             if beta.override_active:
                 st.info("Selected industry's beta is manually overridden. Only its row uses that override; "
                         "other industries retain their individual source betas.")
-            table = industry_comparison(betas, p, industry, beta.override_active)
-            search = st.text_input("Search industries", placeholder="Type part of an industry name")
-            visible = table[table["Industry"].str.contains(search, case=False, regex=False)] if search else table
-            st.caption(f"{len(table)} valid industries · Selected: {industry}. Click a column header to sort. Export includes all rows.")
-            formats = {column: "{:.4%}" for column in table.columns if "(decimal)" in column}
-            formats.update({"Source beta": "{:.8f}", "Beta used": "{:.8f}", "Equity beta": "{:.8f}"})
-            st.dataframe(visible.style.format(formats), hide_index=True, width="stretch", height=520)
-            st.download_button("Download all-industry CSV",
-                               all_industry_export(table, p, country, beta_state, records, generated_at),
-                               file_name="all_industries_cost_of_capital.csv", mime="text/csv", on_click="ignore")
+            try:
+                table = industry_comparison(betas, p, industry, beta.override_active)
+            except InputError as exc:
+                st.error(f"The all-industry comparison cannot calculate every industry with these assumptions: {exc}")
+            else:
+                if industry not in betas:
+                    st.info("The selected industry's source beta is unavailable. Its additional selected-project row uses "
+                            "the explicit manual beta; all source-industry rows retain their own betas.")
+                search = st.text_input("Search industries", placeholder="Type part of an industry name")
+                visible = table[table["Industry"].str.contains(search, case=False, regex=False)] if search else table
+                st.caption(f"{len(betas)} source industries · Selected: {industry}. Click a column header to sort. Export includes all rows.")
+                formats = {column: "{:.4%}" for column in table.columns if "(decimal)" in column}
+                formats.update({"Source beta": "{:.8f}", "Beta used": "{:.8f}", "Equity beta": "{:.8f}"})
+                st.dataframe(visible.style.format(formats, na_rep="Unavailable"), hide_index=True, width="stretch", height=520)
+                st.download_button("Download all-industry CSV",
+                                   all_industry_export(table, p, country, beta_state, records, generated_at),
+                                   file_name="all_industries_cost_of_capital.csv", mime="text/csv", on_click="ignore")
         else:
             st.info("Complete the required project assumptions to calculate all industries.")
     with methodology_tab:
@@ -1294,6 +1398,31 @@ class FinancialVerification(unittest.TestCase):
         with self.assertRaises(DataUnavailable):
             parse_oecd_csv("wrong,column\n1,2", 2026)
 
+    def test_oecd_truncated_and_misaligned_rows(self):
+        header = "REF_AREA,FREQ,MEASURE,TARGETING,UNIT_MEASURE,SECTOR,DIV_TREATMENT,RATE_STRUCTURE,TAX_BASE,TIME_PERIOD,OBS_VALUE,UNIT_MULT\n"
+        prefix = "USA,A,CIT_C,ST,PT_INC_TAX,S13,_Z,_Z,_Z"
+        for row in (prefix, prefix + ",2026,25", prefix + ",2026,25,0,unexpected"):
+            with self.subTest(row=row), self.assertRaises(DataUnavailable):
+                parse_oecd_csv(header + row, 2026)
+
+    def test_corrupt_xls_uses_official_html_fallback(self):
+        # Exercise the provider boundary with actual exception types emitted by xlrd.
+        html = "<p>Date of Analysis: January 2026</p><table><tr><th>Industry Name</th><th>Unlevered beta</th></tr>"
+        html += "".join(f"<tr><td>Industry {i}</td><td>0.8</td></tr>" for i in range(20)) + "</table>"
+        for failure in (struct.error("truncated XLS"), IndexError("missing sector"), EOFError("incomplete XLS")):
+            responses = []
+            for url, content in ((BETA_XLS, b"truncated workbook"), (BETA_HTML, html.encode())):
+                response = requests.Response()
+                response.status_code, response.url, response._content, response.encoding = 200, url, content, "utf-8"
+                responses.append(response)
+            with self.subTest(error=type(failure).__name__), \
+                    patch(__name__ + ".http_get", side_effect=responses), \
+                    patch.object(xlrd, "open_workbook", side_effect=failure):
+                dataset = fetch_betas()
+                self.assertEqual(dataset.url, BETA_HTML)
+                self.assertEqual(len(dataset.observations), 20)
+                self.assertIn("HTML fallback", dataset.note)
+
     def test_yield_country_and_maturity(self):
         html = """<title>Colombia 10-Year Government Bond Yield</title>
         <meta name="description" content="The yield on Colombia 10Y eased on November 13, 2026.">
@@ -1336,6 +1465,46 @@ class FinancialVerification(unittest.TestCase):
         with self.assertRaises(DataUnavailable):
             parse_yield_html(html.replace("US 10Y", "US 5Y"), "United States", board=True)
 
+    def test_uk_yield_short_country_name(self):
+        html = """<title>UK 10 Year Bond Yield - Quote - Chart</title>
+        <script>TEChartsMeta = [{"name":"UK 10Y","full_name":"UK 10 Year Bond Yield",
+        "symbol":"GUKG10:IND","type":"Bond","last":4.25}];</script>"""
+        quote, _, _ = parse_yield_html(html, "United Kingdom")
+        self.assertAlmostEqual(quote, 0.0425)
+        with self.assertRaises(DataUnavailable):
+            parse_yield_html(html, "United States")
+
+    def test_nominal_yield_rejects_tips_and_conflicting_symbols(self):
+        for identity, symbol in (("US 10Y TIPS", "USGG10YR:IND"),
+                                 ("US 10Y Inflation-Linked", "USGG10YR:IND"),
+                                 ("US 10Y Real Yield", "USGG10YR:IND"),
+                                 ("US 10Y", "USGG5YR:IND")):
+            html = '<title>US 10 Year Treasury Note Yield</title><script>TEChartsMeta = ' + json.dumps(
+                [{"full_name": identity, "symbol": symbol, "last":2.3}]) + ';</script>'
+            with self.subTest(identity=identity, symbol=symbol), self.assertRaises(DataUnavailable):
+                parse_yield_html(html, "United States")
+        html = """<title>Government Bond 10y</title><meta name="description" content="Government Bond 10y">
+        <table><tr data-symbol="USGG10YR:IND"><td>
+        <a href="/united-states/government-bond-yield">US 10Y TIPS</a></td><td id="p">2.3</td></tr></table>"""
+        with self.assertRaises(DataUnavailable):
+            parse_yield_html(html, "United States", board=True)
+        with self.assertRaises(DataUnavailable):
+            parse_yield_html(html.replace("US 10Y TIPS", "US 10Y").replace("USGG10YR:IND", "USGG5YR:IND"),
+                             "United States", board=True)
+
+    def test_malformed_optional_metadata_keeps_valid_table_fallback(self):
+        table = """<table><tr data-symbol="USGG10YR:IND"><td>
+        <a href="/united-states/government-bond-yield">US 10Y</a></td>
+        <td id="p">4.12</td><td id="date">Nov/13</td></tr></table>"""
+        payloads = ['[invalid JSON', '[{"name":"US 10Y","last":true}]',
+                    '[{"name":"US 10Y","last":[4.1]}]']
+        for payload in payloads:
+            html = '<title>US 10 Year Treasury Note Yield</title><script>TEChartsMeta = ' + payload + ';</script>' + table
+            with self.subTest(payload=payload):
+                quote, _, note = parse_yield_html(html, "United States")
+                self.assertEqual(quote, 0.0412)
+                self.assertIn("Table fallback", note)
+
     def test_yield_date_is_not_historical_news(self):
         html = """<title>Colombia 10-Year Government Bond Yield</title>
         <script>TEChartsMeta = [{"name":"Colombia 10Y","last":12.698}];</script>
@@ -1350,9 +1519,35 @@ class FinancialVerification(unittest.TestCase):
         self.assertEqual(parse_number("−0.5"), -0.5)
         self.assertEqual(parse_number(".5"), 0.5)
         self.assertIsNone(parse_number("N/A"))
-        for malformed in ("1.2.3", "1,5", "unknown"):
+        for malformed in ("1.2.3", "1,5", "unknown", True, False, 10 ** 400):
             with self.subTest(value=malformed), self.assertRaises(DataUnavailable):
                 parse_number(malformed)
+
+    def test_huge_integer_calculation_input_is_controlled(self):
+        with self.assertRaises(InputError):
+            calculate(replace(REFERENCE_INPUTS, beta_u=10 ** 400))
+
+    def test_newer_source_values_survive_older_country_cache(self):
+        now = datetime.now(timezone.utc)
+        old_time = (now - timedelta(minutes=1)).isoformat()
+        old = Dataset("Source", "https://example.org", old_time, {"yield": Observation(0.04, "2026")})
+        new = replace(old, retrieved_at=now.isoformat(), observations={"yield": Observation(0.05, "2026")})
+        last_good = {"yield:USA": new}
+        state = reconcile_sources({"yield:USA": old}, last_good, 3600)["yield:USA"]
+        self.assertEqual(lookup(state, "yield").value, 0.05)
+        self.assertEqual(last_good["yield:USA"].retrieved_at, new.retrieved_at)
+        failure = FetchFailure(old.source, old.url, old_time, "Earlier failed request")
+        state = reconcile_sources({"yield:USA": failure}, last_good, 3600)["yield:USA"]
+        self.assertEqual(lookup(state, "yield").value, 0.05)
+        self.assertEqual(state.error, "")
+
+    def test_missing_selected_source_beta_retains_explicit_manual_row(self):
+        frame = industry_comparison({"Other": Observation(1.2, "2026")}, REFERENCE_INPUTS, "Selected", True)
+        selected = frame[frame["Selected"]].iloc[0]
+        self.assertTrue(pd.isna(selected["Source beta"]))
+        self.assertEqual(selected["Beta used"], REFERENCE_INPUTS.beta_u)
+        self.assertTrue(selected["Beta overridden"])
+        self.assertEqual(selected["USD WACC (decimal)"], calculate(REFERENCE_INPUTS).wacc_us)
 
     def test_source_failures_and_stale_label(self):
         failure = FetchFailure("Test source", "https://example.org", utc_now(), "HTTP 403")
@@ -1374,6 +1569,7 @@ class FinancialVerification(unittest.TestCase):
         for field, value in asdict(r).items():
             self.assertEqual(results[field], value)
         self.assertEqual(next(row["value"] for row in rows if row["field"] == "selected_currency"), "COP")
+        self.assertEqual(next(row["currency"] for row in rows if row["field"] == "spread_foreign_auto"), "COP")
 
     def test_no_direct_wacc_conversion(self):
         r = calculate(REFERENCE_INPUTS)
