@@ -44,7 +44,7 @@ OECD_API = f"https://sdmx.oecd.org/public/rest/v1/data/{OECD_FLOW}/.A.CIT_C.ST..
 BONDS_URL = "https://tradingeconomics.com/bonds"
 DEFAULT_INDUSTRY = "Software (System & Application)"
 USER_AGENT = "InternationalCostOfCapital/1.0 (educational public-data reader)"
-APP_REVISION = "2026-11-16.1"
+APP_REVISION = "2026-11-16.2"
 
 # ISO 3166-1 alpha-3 / ISO 4217. A missing public quote never removes a country.
 # Bulgaria adopted EUR in 2026. Euro-area yields remain country-specific.
@@ -565,7 +565,13 @@ def fetch_spread() -> Dataset:
 
 
 def parse_oecd_csv(text: str, current_year: int) -> dict[str, Observation]:
-    reader = csv.DictReader(io.StringIO(text.lstrip("\ufeff")))
+    try:
+        return _parse_oecd_rows(csv.DictReader(io.StringIO(text.lstrip("\ufeff"))), current_year)
+    except csv.Error as exc:
+        raise DataUnavailable(f"OECD response could not be parsed as CSV: {exc}") from exc
+
+
+def _parse_oecd_rows(reader: csv.DictReader, current_year: int) -> dict[str, Observation]:
     required = {"REF_AREA", "FREQ", "MEASURE", "TARGETING", "UNIT_MEASURE", "SECTOR",
                 "DIV_TREATMENT", "RATE_STRUCTURE", "TAX_BASE", "TIME_PERIOD", "OBS_VALUE", "UNIT_MULT"}
     if not required.issubset(reader.fieldnames or []):
@@ -1404,6 +1410,11 @@ class FinancialVerification(unittest.TestCase):
         for row in (prefix, prefix + ",2026,25", prefix + ",2026,25,0,unexpected"):
             with self.subTest(row=row), self.assertRaises(DataUnavailable):
                 parse_oecd_csv(header + row, 2026)
+
+    def test_oecd_oversized_error_page_is_recoverable(self):
+        # A provider can return an HTML error document with HTTP 200.
+        with self.assertRaises(DataUnavailable):
+            parse_oecd_csv("<html>" + "x" * (csv.field_size_limit() + 1) + "</html>", 2026)
 
     def test_corrupt_xls_uses_official_html_fallback(self):
         # Exercise the provider boundary with actual exception types emitted by xlrd.
